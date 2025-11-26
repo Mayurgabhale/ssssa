@@ -1,5 +1,4 @@
 
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -13,6 +12,10 @@ const { fetchAllIpAddress, ipRegionMap } = require("./services/excelService");
 const { getDeviceInfo } = require("./services/excelService");
 const { sendTeamsAlert }    = require("./services/teamsService");
 
+const controllerData = JSON.parse(
+  fs.readFileSync("./src/data/ControllerDataWithDoorReader.json", "utf8")
+);
+
 const app = express();
 const PORT = process.env.PORT || 80;
 
@@ -23,6 +26,18 @@ function pruneOldEntries(entries, days = 30) {
 }
 function getLogFileForDate(dt) {
   return `./deviceLogs-${dt.toISODate()}.json`;
+}
+
+function safeJsonParse(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, "utf8").trim();
+    if (!content) return {};  // empty file = empty object
+    return JSON.parse(content);
+  } catch (err) {
+    console.error("❌ Corrupted JSON file detected:", filePath);
+    console.error("Error:", err.message);
+    return {};  // fallback so server NEVER crashes
+  }
 }
 
 
@@ -46,9 +61,14 @@ let deviceStatus = {};
 // Load only today's logs
 const today = DateTime.now().setZone("Asia/Kolkata");
 const todayLogFile = getLogFileForDate(today);
+
+
+
 let todayLogs = fs.existsSync(todayLogFile)
-  ? JSON.parse(fs.readFileSync(todayLogFile, "utf8"))
+  ? safeJsonParse(todayLogFile)
   : {};
+
+
 
 // Persist today's logs
 function saveTodayLogs() {
@@ -67,12 +87,13 @@ function logDeviceChange(ip, status) {
   }
 }
 
-// Ping devices
+
 async function pingDevices() {
-const limit = require("p-limit")(20);
+  const limit = require("p-limit")(20);
+
   await Promise.all(
     devices.map(ip =>
-    limit(async () => {
+      limit(async () => {
         const newStatus = await pingHost(ip);
         if (deviceStatus[ip] !== newStatus) {
           logDeviceChange(ip, newStatus);
@@ -81,9 +102,40 @@ const limit = require("p-limit")(20);
       })
     )
   );
-  console.log("Updated device status:", deviceStatus);
- }
 
+  // ✅ Build Controller + Door Status
+  buildControllerStatus();
+
+  console.log("Updated device status:", deviceStatus);
+}
+
+
+// 📝📝📝📝📝📝
+
+let fullStatus = [];
+function buildControllerStatus() {
+  fullStatus = controllerData.map(controller => {
+    const ip = controller.IP_address.trim();
+    const status = deviceStatus[ip] || "Unknown";
+
+    // If controller offline, mark all doors offline too
+    const doors = controller.Doors.map(d => ({
+      ...d,
+      status: status === "Online" ? "Online" : "Offline",
+    }));
+
+    return {
+      controllername: controller.controllername,
+      IP_address: ip,
+      Location: controller.Location || "Unknown",
+      City: controller.City || "Unknown",
+      controllerStatus: status,
+      Doors: doors,
+    };
+  });
+}
+
+// 📝📝📝📝📝📝
 
 
 const notifiedOffline=new Set();
@@ -119,7 +171,9 @@ app.get("/api/devices/history", (req, res) => {
     .filter(f => f.startsWith("deviceLogs-") && f.endsWith(".json"));
   const combined = {};
   for (const f of files) {
-    const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    // const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    const dayLogs = safeJsonParse(f);
+
     for (const ip of Object.keys(dayLogs)) {
       combined[ip] = (combined[ip] || []).concat(dayLogs[ip]);
     }
@@ -139,7 +193,9 @@ app.get("/api/region/:region/history", (req, res) => {
   const regionLogs = {};
 
   for (const f of files) {
-    const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    // const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    const dayLogs = safeJsonParse(f);
+
     for (const ip of Object.keys(dayLogs)) {
       if (ipRegionMap[ip] === region) {
         regionLogs[ip] = (regionLogs[ip] || []).concat(dayLogs[ip]);
@@ -164,7 +220,9 @@ app.get("/api/device/history/:ip", (req, res) => {
     .filter(f => f.startsWith("deviceLogs-") && f.endsWith(".json"));
   let history = [];
   for (const f of files) {
-    const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    // const dayLogs = JSON.parse(fs.readFileSync(f, "utf8"));
+    const dayLogs = safeJsonParse(f);
+
     if (dayLogs[ip]) history = history.concat(dayLogs[ip]);
   }
   if (!history.length) {
@@ -175,48 +233,14 @@ app.get("/api/device/history/:ip", (req, res) => {
 });
 
 
+// Get all controller + door statuses
+app.get("/api/controllers/status", (req, res) => {
+  res.json(fullStatus);
+});
 
 
 
 
-
-
-// async function checkNotifications() {
-//   const now = DateTime.now().setZone("Asia/Kolkata");
-//   for (const [ip, status] of Object.entries(deviceStatus)) {
-//     // get the last timestamp this ip changed state
-//     const logs = todayLogs[ip] || [];
-//     const lastEntry = logs[logs.length - 1];
-//     if (!lastEntry) continue;
-//     const changedAt = DateTime.fromISO(lastEntry.timestamp);
-//     const minutesDown = now.diff(changedAt, 'minutes').minutes;
-
-//     const dev = getDeviceInfo(ip);
-//     if (!dev) continue;
-//     const { device_name, location, region, device_type } = dev;
-
-//     // 1) OFFLINE > 5m and not yet notified
-//     if (
-//       status === "Offline" &&
-//       minutesDown >= 5 &&
-//       !notifiedOffline.has(ip)
-//     ) {
-//       const msg = `❗️ **${device_name}** (${ip}) in ${location}, ${region} (${device_type}) has been **OFFLINE** for over 5 minutes.`;
-//       await sendTeamsAlert(region, msg);
-//       notifiedOffline.add(ip);
-//     }
-
-//     // 2) Back ONLINE after offline alert
-//     if (
-//       status === "Online" &&
-//       notifiedOffline.has(ip)
-//     ) {
-//       const msg = `✅ **${device_name}** (${ip}) in ${location}, ${region} (${device_type}) is **back ONLINE**.`;
-//       await sendTeamsAlert(region, msg);
-//       notifiedOffline.delete(ip);
-//     }
-//   }
-// }
 
 
 
@@ -230,3 +254,14 @@ app.get("/api/device/history/:ip", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+
+
+
+
+
+
+
+
+
+
